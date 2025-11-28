@@ -1,67 +1,87 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from typing import List
 
-from config import settings
+from fastapi import FastAPI, HTTPException
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+
 from schemas import GenerationRequest, GenerationResponse
 from service import llm_engine
 
+executor = ThreadPoolExecutor(max_workers=1)
 
-# 1. Lifespan: Загрузка модели ПЕРЕД стартом приема запросов
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Код при запуске
-    try:
-        llm_engine.load_model()
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        raise e
+    print("Загружаем модель Llama...")
+    llm_engine.load_model()
     yield
-    # Код при выключении (если нужно освободить VRAM)
-    # del llm_engine.model
-    # torch.cuda.empty_cache()
+    executor.shutdown()
 
+app = FastAPI(title="LLM → SEO Keywords API", lifespan=lifespan)
 
-app = FastAPI(title="Llama 3 API", lifespan=lifespan)
+def parse_queries(content: str) -> List[str]:
+    """Извлекает 5 запросов из ответа модели в формате [1]: запрос"""
+    queries = []
+    for line in content.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("[") and "]:" in line:
+            query = line.split("]:", 1)[1].strip()
+            if query:
+                queries.append(query)
+    return queries[:5]  # строго не больше 5
 
-
-@app.post("/v1/chat/completions")
-async def generate_chat(request: GenerationRequest):
-    """
-    Основной эндпоинт. Поддерживает как stream=True, так и обычный ответ.
-    """
+@app.post("/v1/chat/completions", response_model=GenerationResponse)
+async def chat_completions(request: GenerationRequest):
     try:
-        # Преобразуем Pydantic модели в список dict
-        messages_dict = [m.model_dump() for m in request.messages]
-        input_ids = llm_engine.prepare_inputs(messages_dict)
+        # Строим промпт на основе request.message (summary)
+        system_prompt = "Ты — SEO-специалист. Твоя задача — перевести краткое описание контента в реальные поисковые запросы (keywords). Строго соблюдай формат ответа!"
+        user_prompt = f"""
+На основе предоставленного краткого содержания сгенерируй ровно 5 поисковых запросов, по которым пользователь может искать эту информацию.
 
-        gen_params = {
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
-            "top_p": request.top_p
+Требования:
+1. Включи и информационные (как, почему, инструкция), и коммерческие (цена, купить, заказать) запросы.
+2. Фразы должны быть естественными для поиска Google/Yandex.
+3. Ответ строго списком вида:
+[1]: Текст запроса
+[2]: Текст запроса
+[3]: Текст запроса
+[4]: Текст запроса
+[5]: Текст запроса
+
+Входное краткое содержание:
+{request.message}
+"""
+
+        # messages как list[dict] для llama_cpp
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        # Фиксированные параметры (можно добавить в Request позже)
+        params = {
+            "max_tokens": 512,
+            "temperature": 0.7,
+            "top_p": 0.9,
         }
 
-        # Вариант 1: Потоковый ответ (рекомендуется для LLM)
-        if request.stream:
-            return StreamingResponse(
-                llm_engine.generate_stream(gen_params, input_ids),
-                media_type="text/event-stream"
-            )
+        # Подготовка и генерация
+        prepared_messages = llm_engine.prepare_inputs(messages)
+        loop = asyncio.get_event_loop()
+        full_content = await loop.run_in_executor(
+            executor,
+            lambda: "".join(llm_engine.generate_stream(params, prepared_messages))
+        )
 
-        # Вариант 2: Обычный ответ (ждем конца генерации)
-        else:
-            full_response = ""
-            # Используем тот же генератор, но собираем строку целиком
-            for chunk in llm_engine.generate_stream(gen_params, input_ids):
-                full_response += chunk
+        queries = parse_queries(full_content)
+        if len(queries) != 5:
+            raise ValueError(f"Модель вернула {len(queries)} запросов вместо 5. Текст: {full_content}")
 
-            return GenerationResponse(content=full_response)
+        return GenerationResponse(queries=queries)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8003, reload=False)

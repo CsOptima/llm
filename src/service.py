@@ -2,18 +2,15 @@ from llama_cpp import Llama
 from threading import Thread
 from config import settings
 
-
 class LLMService:
     def __init__(self):
         self.llm = None
 
     def load_model(self):
         print(f"Loading Llama-3 GGUF via llama.cpp on Metal...")
-
         # Вам нужно сначала скачать файл модели вручную или через скрипт
         # Например, скачайте файл .gguf c HuggingFace и положите в папку models/
         model_path = "../model/model.gguf"
-
         # n_gpu_layers=-1 переносит ВСЕ слои на M3 Pro GPU
         self.llm = Llama(
             model_path=model_path,
@@ -36,11 +33,9 @@ class LLMService:
             top_p=params.get("top_p", 0.9),
             stream=True
         )
-
         for chunk in stream:
             delta = chunk['choices'][0]['delta']
             if 'content' in delta:
                 yield delta['content']
-
 
 llm_engine = LLMService()
